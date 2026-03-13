@@ -1,0 +1,384 @@
+'use client';
+
+import { useState, useEffect, useRef } from 'react';
+import { Message, Product } from '@/types/chat';
+import { ChatMessage } from './ChatMessage';
+import { ChatInput } from './ChatInput';
+import { Loader2, X } from 'lucide-react';
+import { SplitText } from '@/components/ui/SplitText';
+import { BekaAppData } from '@/hooks/useShopifyData';
+import { useStoreLogo } from '@/hooks/useStoreLogo';
+import { useChatwootMessages } from '@/hooks/useChatwootMessages';
+
+const STORAGE_KEY = 'beka-chat-history';
+
+function generateId(): string {
+    return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+interface ChatContainerProps {
+    onClose?: () => void;
+    shopifyData?: BekaAppData | null;
+    contactId?: number | null;
+}
+
+export function ChatContainer({ onClose, shopifyData, contactId }: ChatContainerProps) {
+    const [messages, setMessages] = useState<Message[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [isHydrated, setIsHydrated] = useState(false);
+    const [logoLoaded, setLogoLoaded] = useState(false);
+    const messagesEndRef = useRef<HTMLDivElement>(null);
+    const processedChatwootIdsRef = useRef<Set<string>>(new Set());
+
+    // Obter logos da loja
+    const { logoFull, logoIcon } = useStoreLogo(shopifyData?.store);
+
+    // Resetar estado de loading do logo quando ele mudar
+    useEffect(() => {
+        setLogoLoaded(false);
+    }, [logoIcon]);
+
+    // Hook para receber mensagens do Chatwoot via SSE
+    const { messages: chatwootMessages } = useChatwootMessages({
+        contactId: contactId ?? null,
+        enabled: !!contactId,
+    });
+
+    // Mesclar mensagens do Chatwoot com mensagens locais
+    useEffect(() => {
+        if (chatwootMessages.length === 0) return;
+
+        // Processar apenas mensagens novas do Chatwoot
+        const newChatwootMessages = chatwootMessages.filter(
+            msg => !processedChatwootIdsRef.current.has(msg.id)
+        );
+
+        if (newChatwootMessages.length === 0) return;
+
+        // Converter mensagens do Chatwoot para formato local
+        const convertedMessages: Message[] = newChatwootMessages.map(msg => {
+            processedChatwootIdsRef.current.add(msg.id);
+            return {
+                id: `chatwoot-${msg.id}`,
+                role: 'assistant' as const,
+                content: msg.content as string | Product[],
+                textContent: msg.textContent,
+                timestamp: msg.timestamp,
+                buttonLabels: msg.buttonLabels,
+                assigneeName: msg.assignee_name,
+            };
+        });
+
+        console.log('[ChatContainer] Mensagens do Chatwoot recebidas:', convertedMessages.length);
+
+        // Desativar loading quando recebemos resposta do Chatwoot
+        setIsLoading(false);
+
+        setMessages(prev => {
+            // Evitar duplicatas
+            const existingIds = new Set(prev.map(m => m.id));
+            const uniqueNewMessages = convertedMessages.filter(m => !existingIds.has(m.id));
+
+            if (uniqueNewMessages.length === 0) return prev;
+
+            return [...prev, ...uniqueNewMessages];
+        });
+    }, [chatwootMessages]);
+
+    // Load messages from localStorage on mount
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem(STORAGE_KEY);
+            if (saved) {
+                const parsed = JSON.parse(saved);
+                setMessages(parsed);
+            }
+        } catch (e) {
+            console.error('Error loading chat history:', e);
+        }
+        setIsHydrated(true);
+    }, []);
+
+    // Save messages to localStorage when they change
+    useEffect(() => {
+        if (isHydrated && messages.length > 0) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+            } catch (e) {
+                console.error('Error saving chat history:', e);
+            }
+        }
+    }, [messages, isHydrated]);
+
+    // Auto-scroll to bottom when new messages arrive
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [messages, isLoading]);
+
+    const sendMessage = async (content: string, audioBlob?: Blob, imageBase64?: string) => {
+        setError(null);
+
+        // Handle Audio URL creation
+        let audioUrl: string | undefined;
+        if (audioBlob) {
+            audioUrl = URL.createObjectURL(audioBlob);
+        }
+
+        // Add user message with 'sending' status
+        const messageId = generateId();
+        const userMessage: Message = {
+            id: messageId,
+            role: 'user',
+            content: content || (imageBase64 ? '[Imagem]' : ''),
+            timestamp: Date.now(),
+            audioUrl: audioUrl,
+            imageUrl: imageBase64,
+            status: 'sending',
+        };
+        setMessages((prev) => [...prev, userMessage]);
+        setIsLoading(true);
+
+        // Enviar para a API de persistir mensagens (via backend para evitar CORS)
+        console.log('[ChatContainer] sendMessage - contactId recebido:', contactId);
+
+        if (contactId) {
+            try {
+                const payload: Record<string, unknown> = {
+                    message: content || '',
+                    contact_id: contactId,
+                    store: shopifyData?.store,
+                    url: shopifyData?.url,
+                };
+
+                if (imageBase64) {
+                    payload.image = imageBase64;
+                }
+
+                // Sempre persistir a mensagem no Chatwoot
+                const persistPromise = fetch('/api/persist-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                // Se tem imagem, também envia para beka_website_assistent
+                const promises: Promise<Response>[] = [persistPromise];
+                if (imageBase64) {
+                    const sendPromise = fetch('/api/send-message', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                    promises.push(sendPromise);
+                }
+
+                console.log('[ChatContainer] Enviando payload para persist-message' + (imageBase64 ? ' e send-message' : '') + ':', { ...payload, image: payload.image ? '[base64]' : undefined });
+
+                const responses = await Promise.all(promises);
+                const persistData = await responses[0].json();
+                console.log('[ChatContainer] Resposta persist-message:', persistData);
+
+                if (responses[1]) {
+                    const sendData = await responses[1].json();
+                    console.log('[ChatContainer] Resposta send-message:', sendData);
+                }
+
+                // Atualizar status para 'delivered' quando API confirma
+                setMessages(prev => prev.map(msg =>
+                    msg.id === messageId
+                        ? { ...msg, status: 'delivered' as const }
+                        : msg
+                ));
+
+                // A resposta virá via polling do Chatwoot
+            } catch (error) {
+                console.error('[ChatContainer] Erro ao enviar:', error);
+                setError('Erro ao enviar mensagem. Tente novamente.');
+                setIsLoading(false);
+                // Manter status como 'sending' para indicar falha
+            }
+        } else {
+            console.warn('[ChatContainer] contactId não disponível, mensagem não pode ser enviada');
+            setError('Não foi possível conectar ao chat. Recarregue a página.');
+            setIsLoading(false);
+        }
+    };
+
+    const handleEditMessage = async (id: string, newContent: string) => {
+        const messageIndex = messages.findIndex((m) => m.id === id);
+        if (messageIndex === -1) return;
+
+        // Keep messages up to the one being edited (exclusive)
+        const newHistory = messages.slice(0, messageIndex);
+        setMessages(newHistory);
+
+        // Update state to newHistory locally, then call sendMessage logic
+        setError(null);
+        setIsLoading(true);
+
+        // Add new user message
+        const userMessage: Message = {
+            id: generateId(),
+            role: 'user',
+            content: newContent,
+            timestamp: Date.now(),
+        };
+
+        setMessages([...newHistory, userMessage]);
+
+        // Enviar para a API de persistir mensagens (via backend para evitar CORS)
+        if (contactId) {
+            try {
+                const persistResponse = await fetch('/api/persist-message', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: newContent,
+                        contact_id: contactId,
+                        store: shopifyData?.store,
+                        url: shopifyData?.url,
+                    }),
+                });
+                const persistData = await persistResponse.json();
+                console.log('[ChatContainer] Mensagem editada persistida:', persistData);
+                // Resposta virá via SSE do Chatwoot
+            } catch (error) {
+                console.error('[ChatContainer] Erro ao persistir mensagem editada:', error);
+            }
+        }
+    };
+
+    const clearHistory = () => {
+        setMessages([]);
+        localStorage.removeItem(STORAGE_KEY);
+    };
+
+    return (
+        <div className="flex flex-col h-full relative overflow-hidden bg-background">
+            {/* Background Decor - Aurora Glow */}
+            <div className="aurora-glow top-[-10%] left-[-10%] opacity-60 animate-pulse pointer-events-none z-0" />
+            <div className="aurora-glow bottom-[10%] right-[-5%] w-[500px] h-[100px] opacity-40 pointer-events-none z-0" />
+
+            {/* Header - Absolute Glass Bar */}
+            <header className="absolute top-0 left-0 right-0 z-50 px-6 pt-6 pb-3 flex items-center justify-between from-surface-white/95 via-surface-white/80 to-transparent backdrop-blur-md transition-all duration-300">
+                <div className="flex items-center gap-3">
+                    <div className="h-10 bg-surface-white/50 backdrop-blur-md flex items-center justify-center shadow-sm border border-white/40 overflow-hidden rounded-full px-2">
+                        <img
+                            src={logoFull || '/logotipo_beka_agro.png'}
+                            alt="Beka"
+                            className="h-8 object-contain"
+                            onError={(e) => {
+                                (e.target as HTMLImageElement).src = '/logotipo_beka_agro.png';
+                            }}
+                        />
+                    </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                    {messages.length > 0 && (
+                        <button
+                            onClick={clearHistory}
+                            className="text-xs font-medium text-text-secondary hover:text-red-500 bg-surface-white/50 hover:bg-surface-white backdrop-blur-md px-4 py-2 rounded-full transition-all border border-white/40 shadow-sm hover:shadow"
+                        >
+                            Limpar
+                        </button>
+                    )}
+                    {onClose && (
+                        <button
+                            onClick={onClose}
+                            className="h-8 w-8 flex items-center justify-center rounded-full bg-surface-white/50 hover:bg-red-500 hover:text-white transition-colors backdrop-blur-md border border-white/40 shadow-sm"
+                        >
+                            <X className="h-5 w-5" />
+                        </button>
+                    )}
+                </div>
+            </header>
+
+            {/* Messages Container */}
+            <div className="flex-1 overflow-y-auto px-4 pt-24 pb-6 space-y-6 scroll-smooth overscroll-contain">
+                {!isHydrated ? (
+                    <div className="flex items-center justify-center h-full">
+                        <Loader2 className="w-8 h-8 animate-spin text-text-primary" />
+                    </div>
+                ) : messages.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center h-full text-center px-4 relative z-0">
+
+                        <h2 className="text-3xl md:text-3xl font-bold text-text-primary mb-3 tracking-tight">
+                            <SplitText
+                                text={(() => {
+                                    // Pegar firstName da Shopify ou o primeiro nome do campo name (formulário)
+                                    const firstName = shopifyData?.customer?.firstName
+                                        || shopifyData?.customer?.name?.split(' ')[0];
+                                    return firstName
+                                        ? `Olá ${firstName}, sou a Beka`
+                                        : "Olá! Sou a Beka";
+                                })()}
+                                delay={300}
+                            />
+                        </h2>
+                        <p className="text-text-secondary max-w-md mb-10 text-lg leading-relaxed font-medium">
+                            <SplitText
+                                text={(() => {
+                                    const firstName = shopifyData?.customer?.firstName
+                                        || shopifyData?.customer?.name?.split(' ')[0];
+                                    return firstName
+                                        ? "Como posso ajudar?"
+                                        : "Como posso te ajudar hoje?";
+                                })()}
+                                delay={1000}
+                                className="text-lg"
+                            />
+                        </p>
+
+                        <div className="flex flex-wrap gap-3 justify-center max-w-2xl">
+                            {['Quais produtos vocês têm?', 'Preciso de ajuda técnica', 'Ver lançamentos da loja'].map((suggestion) => (
+                                <button
+                                    key={suggestion}
+                                    onClick={() => sendMessage(suggestion)}
+                                    className="px-6 py-3 rounded-[32px] bg-surface-white/60 backdrop-blur-sm text-text-primary hover:bg-surface-white transition-all duration-300 shadow-sm hover:shadow-lg border border-white/40 hover:-translate-y-0.5 text-sm font-medium"
+                                >
+                                    {suggestion}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                ) : (
+                    <div className="max-w-4xl mx-auto w-full space-y-6 pb-4">
+                        {messages.map((message) => (
+                            <ChatMessage
+                                key={message.id}
+                                message={message}
+                                onButtonClick={sendMessage}
+                                onEdit={handleEditMessage}
+                                logoIcon={logoIcon}
+                            />
+                        ))}
+                        {isLoading && (
+                            <div className="flex items-center gap-2 text-text-secondary animate-in fade-in pl-4">
+                                <div className="flex items-center gap-1.5 px-5 py-4 bg-surface-white/50 backdrop-blur-sm rounded-[24px] rounded-bl-sm shadow-sm">
+                                    <span className="w-2 h-2 bg-text-primary rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                                    <span className="w-2 h-2 bg-text-primary rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                                    <span className="w-2 h-2 bg-text-primary rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+                {error && (
+                    <div className="flex justify-center p-4">
+                        <div className="bg-red-50 text-red-500 text-xs px-3 py-2 rounded-lg border border-red-100">
+                            {error}
+                        </div>
+                    </div>
+                )}
+                <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input Area */}
+            <ChatInput onSend={sendMessage} isLoading={isLoading} />
+        </div>
+    );
+}
