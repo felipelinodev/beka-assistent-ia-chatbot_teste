@@ -70,8 +70,6 @@ export function ChatContainer({ onClose, shopifyData, contactId }: ChatContainer
             };
         });
 
-        console.log('[ChatContainer] Mensagens do Chatwoot recebidas:', convertedMessages.length);
-
         // Desativar loading quando recebemos resposta do Chatwoot
         setIsLoading(false);
 
