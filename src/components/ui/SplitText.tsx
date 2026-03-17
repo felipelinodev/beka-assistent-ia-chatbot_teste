@@ -15,7 +15,7 @@ export function SplitText({
     text,
     className = '',
     delay = 0,
-    charDelay = 50,
+    charDelay = 51,
     as: Component = 'span'
 }: SplitTextProps) {
     const [isVisible, setIsVisible] = useState(false);
